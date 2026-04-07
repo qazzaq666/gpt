@@ -1,239 +1,321 @@
 import sys
 import time
-from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from playwright.sync_api import (
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-    Page,
-    Locator,
-)
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
 CHATGPT_URL = "https://chatgpt.com/"
-PROFILE_DIR = Path(".playwright_profile").resolve()
+CDP_URL = "http://127.0.0.1:9222"
 
 
 class ChatGPTWebClient:
     def __init__(self, page: Page):
         self.page = page
 
-    def open(self) -> None:
-        self.page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-        self.page.wait_for_timeout(2000)
-
     def ensure_ready(self) -> None:
-        """
-        Ждём, пока на странице появится поле ввода.
-        Если пользователь не залогинен, он может вручную войти в аккаунт.
-        """
-        if self._has_prompt_box(timeout_ms=5000):
-            return
-
-        print("\n[!] Похоже, поле ввода не найдено.")
-        print("[!] Скорее всего, нужно войти в аккаунт ChatGPT вручную в открытом окне браузера.")
-        input("[?] После входа нажми Enter здесь... ")
-
-        self.page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-        self.page.wait_for_timeout(2000)
-
-        if not self._has_prompt_box(timeout_ms=15000):
-            raise RuntimeError(
-                "Не удалось найти поле ввода ChatGPT даже после ручного входа. "
-                "Проверь, открылся ли chatgpt.com и доступен ли чат."
-            )
+        self._wait_for_prompt_box(timeout_s=30)
+        self._wait_until_idle(timeout_s=120)
 
     def send_message(self, text: str) -> None:
+        self._wait_until_idle(timeout_s=180)
+
         box = self._get_prompt_box()
         if box is None:
-            raise RuntimeError("Не удалось найти поле ввода сообщения.")
+            raise RuntimeError("Не удалось найти поле ввода.")
 
         box.click()
         box.fill(text)
-        box.press("Enter")
+        self.page.wait_for_timeout(300)
 
-    def get_last_assistant_message_text(self, timeout_s: int = 120) -> str:
-        """
-        Ждём завершения нового ответа и возвращаем текст последнего ответа ассистента.
-        Логика с запасом: берём количество ответов до отправки, потом ждём, пока станет больше
-        или пока последний ответ перестанет меняться.
-        """
-        start_time = time.time()
+        if not self._click_send_button():
+            box.press("Enter")
 
-        previous_count = self._assistant_message_count()
+        self.page.wait_for_timeout(500)
 
-        # Ждём появления нового ответа ассистента
-        while time.time() - start_time < timeout_s:
-            current_count = self._assistant_message_count()
-            if current_count > previous_count:
-                break
-            self.page.wait_for_timeout(500)
-        else:
-            raise TimeoutError("Новый ответ ассистента не появился вовремя.")
-
-        # Теперь ждём, пока текст перестанет меняться
+    def wait_for_new_response(self, previous_messages: List[str], timeout_s: int = 240) -> str:
+        start = time.time()
+        last_candidate = ""
         stable_rounds = 0
-        last_text = ""
+        saw_generation = False
 
-        while time.time() - start_time < timeout_s:
-            current_text = self._read_last_assistant_message()
-            if current_text and current_text == last_text:
+        while time.time() - start < timeout_s:
+            if self._is_generating():
+                saw_generation = True
+
+            current_messages = self._get_assistant_messages()
+            new_messages = self._diff_messages(previous_messages, current_messages)
+            candidate = new_messages[-1].strip() if new_messages else ""
+
+            if candidate:
+                if candidate == last_candidate:
+                    stable_rounds += 1
+                else:
+                    last_candidate = candidate
+                    stable_rounds = 0
+
+            if (
+                candidate
+                and saw_generation
+                and not self._is_generating()
+                and stable_rounds >= 2
+            ):
+                return candidate
+
+            self.page.wait_for_timeout(1000)
+
+        if last_candidate:
+            return last_candidate
+
+        raise TimeoutError("Не удалось дождаться нового ответа от ChatGPT.")
+
+    def get_assistant_messages(self) -> List[str]:
+        return self._get_assistant_messages()
+
+    def minimize_window(self) -> None:
+        """
+        Сворачивает окно Chrome через CDP.
+        """
+        session = self.page.context.new_cdp_session(self.page)
+        window_info = session.send("Browser.getWindowForTarget")
+        window_id = window_info["windowId"]
+        session.send("Browser.setWindowBounds", {
+            "windowId": window_id,
+            "bounds": {"windowState": "minimized"}
+        })
+
+    def bring_to_front(self) -> None:
+        """
+        Возвращает вкладку на передний план.
+        """
+        self.page.bring_to_front()
+
+    def _get_prompt_box(self):
+        selectors = [
+            "textarea",
+            "[contenteditable='true']",
+        ]
+
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if locator.is_visible(timeout=1000):
+                    return locator
+            except Exception:
+                pass
+        return None
+
+    def _wait_for_prompt_box(self, timeout_s: int = 30) -> None:
+        start = time.time()
+        while time.time() - start < timeout_s:
+            if self._get_prompt_box() is not None:
+                return
+            self.page.wait_for_timeout(1000)
+        raise RuntimeError("Поле ввода ChatGPT не появилось.")
+
+    def _click_send_button(self) -> bool:
+        selectors = [
+            "button[data-testid='send-button']",
+            "button[aria-label*='Send']",
+            "button[aria-label*='Отправ']",
+        ]
+
+        for selector in selectors:
+            try:
+                btn = self.page.locator(selector).first
+                if btn.is_visible(timeout=700) and btn.is_enabled():
+                    btn.click()
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def _is_generating(self) -> bool:
+        selectors = [
+            "button[data-testid='stop-button']",
+            "button[aria-label*='Stop']",
+            "button[aria-label*='Останов']",
+        ]
+
+        for selector in selectors:
+            try:
+                btn = self.page.locator(selector).first
+                if btn.is_visible(timeout=500):
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    def _wait_until_idle(self, timeout_s: int = 120) -> None:
+        start = time.time()
+        stable_rounds = 0
+
+        while time.time() - start < timeout_s:
+            generating = self._is_generating()
+
+            if not generating:
                 stable_rounds += 1
             else:
                 stable_rounds = 0
-                last_text = current_text
 
-            # 4 стабильных проверки по 700 мс — обычно хватает,
-            # чтобы не срезать ответ посередине.
-            if current_text and stable_rounds >= 4:
-                return current_text.strip()
+            if stable_rounds >= 2:
+                return
 
-            self.page.wait_for_timeout(700)
+            self.page.wait_for_timeout(1000)
 
-        if last_text.strip():
-            return last_text.strip()
+        raise TimeoutError("ChatGPT слишком долго не завершает генерацию.")
 
-        raise TimeoutError("Не удалось дочитать ответ ассистента до конца.")
-
-    def _has_prompt_box(self, timeout_ms: int = 3000) -> bool:
-        try:
-            box = self._get_prompt_box(timeout_ms=timeout_ms)
-            return box is not None
-        except Exception:
-            return False
-
-    def _get_prompt_box(self, timeout_ms: int = 3000) -> Optional[Locator]:
-        """
-        Пытаемся найти поле ввода максимально мягко.
-        Сначала — по роли textbox, потом — запасные варианты.
-        """
-        candidates = [
-            lambda: self.page.get_by_role("textbox"),
-            lambda: self.page.locator("textarea"),
-            lambda: self.page.locator("[contenteditable='true']"),
-        ]
-
-        for get_locator in candidates:
-            try:
-                locator = get_locator().first
-                locator.wait_for(state="visible", timeout=timeout_ms)
-                return locator
-            except Exception:
-                continue
-
-        return None
-
-    def _assistant_message_count(self) -> int:
+    def _get_assistant_messages(self) -> List[str]:
         selectors = [
             "[data-message-author-role='assistant']",
-            "article",
             "[data-testid^='conversation-turn-']",
+            "article",
         ]
 
-        best_count = 0
+        messages = []
+
         for selector in selectors:
             try:
-                count = self.page.locator(selector).count()
-                if count > best_count:
-                    best_count = count
-            except Exception:
-                continue
-
-        return best_count
-
-    def _read_last_assistant_message(self) -> str:
-        """
-        Читаем последний ответ ассистента через несколько fallback-селекторов.
-        """
-        selector_candidates = [
-            "[data-message-author-role='assistant']",
-            "[data-testid^='conversation-turn-']",
-            "article",
-        ]
-
-        for selector in selector_candidates:
-            try:
-                locator = self.page.locator(selector)
-                count = locator.count()
+                loc = self.page.locator(selector)
+                count = loc.count()
                 if count == 0:
                     continue
 
-                text = locator.nth(count - 1).inner_text(timeout=3000).strip()
-                if text:
-                    return text
+                temp = []
+                for i in range(count):
+                    try:
+                        text = loc.nth(i).inner_text(timeout=1500).strip()
+                        if text and len(text) > 1:
+                            temp.append(text)
+                    except Exception:
+                        pass
+
+                if len(temp) > len(messages):
+                    messages = temp
             except Exception:
+                pass
+
+        cleaned = []
+        prev = None
+        for msg in messages:
+            if msg != prev:
+                cleaned.append(msg)
+            prev = msg
+
+        return cleaned
+
+    @staticmethod
+    def _diff_messages(old: List[str], new: List[str]) -> List[str]:
+        if len(new) <= len(old):
+            if new and old and new[-1] != old[-1]:
+                return [new[-1]]
+            return []
+        return new[len(old):]
+
+
+def find_existing_chatgpt_page(context) -> Optional[Page]:
+    for page in context.pages:
+        try:
+            url = page.url or ""
+            if "chatgpt.com" in url:
+                return page
+        except Exception:
+            pass
+    return None
+
+
+def attach_to_existing_chrome():
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp(CDP_URL)
+        except Exception as e:
+            raise RuntimeError(
+                "Не удалось подключиться к Chrome через CDP.\n"
+                "Проверь, что Chrome запущен с --remote-debugging-port=9222"
+            ) from e
+
+        if not browser.contexts:
+            raise RuntimeError("У подключённого Chrome нет доступных контекстов.")
+
+        context = browser.contexts[0]
+
+        page = find_existing_chatgpt_page(context)
+        if page is None:
+            raise RuntimeError(
+                "Не нашла открытую вкладку с chatgpt.com.\n"
+                "Открой ChatGPT вручную в этом Chrome и запусти скрипт ещё раз."
+            )
+
+        client = ChatGPTWebClient(page)
+        client.ensure_ready()
+
+        print("[OK] Подключилась к уже открытому ChatGPT.")
+        print("Команды:")
+        print("  /exit      - выход")
+        print("  /hide      - свернуть окно Chrome")
+        print("  /show      - показать вкладку")
+        print("  /messages  - показать число найденных ответов")
+        print()
+
+        while True:
+            try:
+                user_text = input("Ты: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nВыход.")
+                break
+
+            if not user_text:
                 continue
 
-        return ""
+            if user_text.lower() == "/exit":
+                break
 
-
-def main() -> None:
-    print("=== ChatGPT Console Prototype ===")
-    print("Команды:")
-    print("  /exit   - выход")
-    print("  /clear  - перезагрузить страницу")
-    print()
-
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            viewport={"width": 1400, "height": 900},
-        )
-
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        client = ChatGPTWebClient(page)
-
-        try:
-            client.open()
-            client.ensure_ready()
-        except Exception as e:
-            browser.close()
-            print(f"[X] Ошибка инициализации: {e}")
-            sys.exit(1)
-
-        print("[OK] ChatGPT открыт. Можно писать сообщения в консоль.\n")
-
-        try:
-            while True:
-                user_text = input("Ты: ").strip()
-
-                if not user_text:
-                    continue
-
-                if user_text.lower() == "/exit":
-                    break
-
-                if user_text.lower() == "/clear":
-                    try:
-                        client.open()
-                        client.ensure_ready()
-                        print("[OK] Страница перезагружена.\n")
-                    except Exception as e:
-                        print(f"[X] Не удалось перезагрузить страницу: {e}\n")
-                    continue
-
+            if user_text.lower() == "/hide":
                 try:
-                    print("[...] Отправляю сообщение...")
-                    client.send_message(user_text)
+                    client.minimize_window()
+                    print("[OK] Окно Chrome свернуто.\n")
+                except Exception as e:
+                    print(f"[X] Не удалось свернуть окно: {e}\n")
+                continue
 
-                    print("[...] Жду ответ...")
-                    answer = client.get_last_assistant_message_text(timeout_s=180)
+            if user_text.lower() == "/show":
+                try:
+                    client.bring_to_front()
+                    print("[OK] Вкладка поднята на передний план.\n")
+                except Exception as e:
+                    print(f"[X] Не удалось показать вкладку: {e}\n")
+                continue
 
-                    print("\nChatGPT:")
-                    print(answer)
-                    print()
-
-                except (PlaywrightTimeoutError, TimeoutError) as e:
-                    print(f"[X] Таймаут: {e}\n")
+            if user_text.lower() == "/messages":
+                try:
+                    msgs = client.get_assistant_messages()
+                    print(f"[OK] Найдено ответов ассистента: {len(msgs)}\n")
                 except Exception as e:
                     print(f"[X] Ошибка: {e}\n")
+                continue
 
-        finally:
-            browser.close()
+            try:
+                previous = client.get_assistant_messages()
+
+                print("[...] Отправляю сообщение...")
+                client.send_message(user_text)
+
+                print("[...] Жду завершения ответа...")
+                answer = client.wait_for_new_response(previous_messages=previous, timeout_s=240)
+
+                print("\nChatGPT:")
+                print(answer)
+        
+            except (TimeoutError, PlaywrightTimeoutError) as e:
+                print(f"[X] Таймаут: {e}\n")
+            except Exception as e:
+                print(f"[X] Ошибка: {e}\n")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        attach_to_existing_chrome()
+    except Exception as e:
+        print(f"[X] {e}")
+        sys.exit(1)
