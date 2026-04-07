@@ -4,8 +4,28 @@ from typing import List, Optional
 
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
+from tts_player import speak_text, set_tts_mode, get_tts_mode, get_tts_modes
+
 CHATGPT_URL = "https://chatgpt.com/"
 CDP_URL = "http://127.0.0.1:9222"
+
+
+def clean_answer(text: str) -> str:
+    if not text:
+        return ""
+
+    prefixes = [
+        "ChatGPT сказал:",
+        "ChatGPT said:",
+    ]
+
+    cleaned = text.strip()
+
+    for prefix in prefixes:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+
+    return cleaned
 
 
 class ChatGPTWebClient:
@@ -72,21 +92,18 @@ class ChatGPTWebClient:
         return self._get_assistant_messages()
 
     def minimize_window(self) -> None:
-        """
-        Сворачивает окно Chrome через CDP.
-        """
         session = self.page.context.new_cdp_session(self.page)
         window_info = session.send("Browser.getWindowForTarget")
         window_id = window_info["windowId"]
-        session.send("Browser.setWindowBounds", {
-            "windowId": window_id,
-            "bounds": {"windowState": "minimized"}
-        })
+        session.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {"windowState": "minimized"},
+            },
+        )
 
     def bring_to_front(self) -> None:
-        """
-        Возвращает вкладку на передний план.
-        """
         self.page.bring_to_front()
 
     def _get_prompt_box(self):
@@ -102,14 +119,17 @@ class ChatGPTWebClient:
                     return locator
             except Exception:
                 pass
+
         return None
 
     def _wait_for_prompt_box(self, timeout_s: int = 30) -> None:
         start = time.time()
+
         while time.time() - start < timeout_s:
             if self._get_prompt_box() is not None:
                 return
             self.page.wait_for_timeout(1000)
+
         raise RuntimeError("Поле ввода ChatGPT не появилось.")
 
     def _click_send_button(self) -> bool:
@@ -173,7 +193,7 @@ class ChatGPTWebClient:
             "article",
         ]
 
-        messages = []
+        messages: List[str] = []
 
         for selector in selectors:
             try:
@@ -182,7 +202,8 @@ class ChatGPTWebClient:
                 if count == 0:
                     continue
 
-                temp = []
+                temp: List[str] = []
+
                 for i in range(count):
                     try:
                         text = loc.nth(i).inner_text(timeout=1500).strip()
@@ -196,12 +217,14 @@ class ChatGPTWebClient:
             except Exception:
                 pass
 
-        cleaned = []
+        cleaned: List[str] = []
         prev = None
+
         for msg in messages:
-            if msg != prev:
-                cleaned.append(msg)
-            prev = msg
+            normalized = clean_answer(msg)
+            if normalized and normalized != prev:
+                cleaned.append(normalized)
+            prev = normalized
 
         return cleaned
 
@@ -211,6 +234,7 @@ class ChatGPTWebClient:
             if new and old and new[-1] != old[-1]:
                 return [new[-1]]
             return []
+
         return new[len(old):]
 
 
@@ -225,14 +249,30 @@ def find_existing_chatgpt_page(context) -> Optional[Page]:
     return None
 
 
-def attach_to_existing_chrome():
+def print_help() -> None:
+    print("[OK] Подключилась к уже открытому ChatGPT.")
+    print("Команды:")
+    print("  /exit               - выход")
+    print("  /hide               - свернуть окно Chrome")
+    print("  /show               - показать вкладку")
+    print("  /messages           - показать число найденных ответов")
+    print("  /voice              - показать текущий TTS")
+    print("  /voices             - показать все TTS")
+    print("  /voice windows      - включить Windows TTS")
+    print("  /voice silero       - включить Silero TTS")
+    print("  /voice yandex       - включить Yandex TTS")
+    print()
+
+
+def attach_to_existing_chrome() -> None:
     with sync_playwright() as p:
         try:
             browser = p.chromium.connect_over_cdp(CDP_URL)
         except Exception as e:
             raise RuntimeError(
                 "Не удалось подключиться к Chrome через CDP.\n"
-                "Проверь, что Chrome запущен с --remote-debugging-port=9222"
+                "Проверь, что Chrome запущен с --remote-debugging-port=9222 "
+                "и --user-data-dir."
             ) from e
 
         if not browser.contexts:
@@ -244,19 +284,12 @@ def attach_to_existing_chrome():
         if page is None:
             raise RuntimeError(
                 "Не нашла открытую вкладку с chatgpt.com.\n"
-                "Открой ChatGPT вручную в этом Chrome и запусти скрипт ещё раз."
+                "Открой ChatGPT вручную в debug-Chrome и запусти скрипт ещё раз."
             )
 
         client = ChatGPTWebClient(page)
         client.ensure_ready()
-
-        print("[OK] Подключилась к уже открытому ChatGPT.")
-        print("Команды:")
-        print("  /exit      - выход")
-        print("  /hide      - свернуть окно Chrome")
-        print("  /show      - показать вкладку")
-        print("  /messages  - показать число найденных ответов")
-        print()
+        print_help()
 
         while True:
             try:
@@ -295,6 +328,24 @@ def attach_to_existing_chrome():
                     print(f"[X] Ошибка: {e}\n")
                 continue
 
+            if user_text.lower() == "/voice":
+                print(f"[OK] Текущий TTS: {get_tts_mode()}\n")
+                continue
+
+            if user_text.lower() == "/voices":
+                modes = ", ".join(get_tts_modes())
+                print(f"[OK] Доступные TTS: {modes}\n")
+                continue
+
+            if user_text.lower().startswith("/voice "):
+                mode = user_text[7:].strip()
+                try:
+                    selected = set_tts_mode(mode)
+                    print(f"[OK] Включён TTS: {selected}\n")
+                except Exception as e:
+                    print(f"[X] Не удалось переключить TTS: {e}\n")
+                continue
+
             try:
                 previous = client.get_assistant_messages()
 
@@ -303,10 +354,17 @@ def attach_to_existing_chrome():
 
                 print("[...] Жду завершения ответа...")
                 answer = client.wait_for_new_response(previous_messages=previous, timeout_s=240)
+                answer = clean_answer(answer)
 
                 print("\nChatGPT:")
                 print(answer)
-        
+                print()
+
+                try:
+                    speak_text(answer)
+                except Exception as e:
+                    print(f"[TTS] Ошибка: {e}")
+
             except (TimeoutError, PlaywrightTimeoutError) as e:
                 print(f"[X] Таймаут: {e}\n")
             except Exception as e:
